@@ -2,6 +2,7 @@ package status
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"maps"
 	"reflect"
@@ -20,6 +21,7 @@ import (
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -164,12 +166,22 @@ func (c *Controller[T]) Reconcile(ctx context.Context, req reconcile.Request) (r
 
 type GenericObjectController[T client.Object] struct {
 	*Controller[*UnstructuredAdapter[T]]
+	// conditionsField locates .status.conditions in T for the partial conversion, nil if T must be fully converted
+	conditionsField *conditionsField
+	// labelKeys are the object labels the metrics read
+	labelKeys []string
 }
 
 func NewGenericObjectController[T client.Object](client client.Client, eventRecorder record.EventRecorder, opts ...option.Function[Option]) *GenericObjectController[T] {
-	return &GenericObjectController[T]{
+	c := &GenericObjectController[T]{
 		Controller: NewController[*UnstructuredAdapter[T]](client, eventRecorder, opts...),
 	}
+	c.labelKeys = lo.Uniq(append(append([]string{}, c.additionalMetricLabels...), c.additionalGaugeMetricLabels...))
+	// Metric fields can read any path of the object, so they need the full conversion
+	if len(c.additionalMetricFields) == 0 && len(c.additionalGaugeMetricFields) == 0 {
+		c.conditionsField = findConditionsField(reflect.TypeOf(object.New[T]()))
+	}
+	return c
 }
 
 func (c *GenericObjectController[T]) Register(_ context.Context, m manager.Manager) error {
@@ -192,18 +204,155 @@ func (c *GenericObjectController[T]) Reconcile(ctx context.Context, req reconcil
 		}
 		return reconcile.Result{}, fmt.Errorf("getting object, %w", err)
 	}
-	// Convert to proper unstructured so conditions appear as []interface{} (JSON-compatible form)
-	// rather than the typed []metav1.Condition that ToPartialUnstructured would produce from a
-	// typed struct. UnstructuredAdapter.GetConditions relies on unstructured.NestedFieldNoCopy
-	// which requires []interface{}.
-	unstructuredContent, err := runtime.DefaultUnstructuredConverter.ToUnstructured(typedObj)
+	unstructuredObj, err := c.toUnstructured(typedObj)
 	if err != nil {
 		return reconcile.Result{}, fmt.Errorf("converting object to unstructured, %w", err)
 	}
-	unstructuredObj := &unstructured.Unstructured{Object: unstructuredContent}
 	unstructuredObj.SetGroupVersionKind(object.GVK(typedObj))
 	return c.reconcileFound(ctx, req, &UnstructuredAdapter[T]{Unstructured: *unstructuredObj})
 }
+
+// toUnstructured converts the fields of the object that the controller reads. The conditions must be in their
+// JSON-compatible form ([]interface{} rather than the typed []metav1.Condition that ToPartialUnstructured would
+// produce from a typed struct) since UnstructuredAdapter.GetConditions relies on unstructured.NestedFieldNoCopy.
+// Converting the whole object gets that right but is the most expensive part of a reconcile for large objects like
+// Nodes, so only the conditions are run through the converter, and only the metadata the controller reads (identity,
+// finalizers, deletion timestamp and the configured labels) is copied from the typed object. Every value the
+// controller reads, and the object reference used for events, is the same as with the full conversion. The smaller
+// object is also what observedConditions and terminatingObjects retain.
+func (c *GenericObjectController[T]) toUnstructured(obj T) (*unstructured.Unstructured, error) {
+	if c.conditionsField == nil {
+		content, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+		if err != nil {
+			return nil, err
+		}
+		return &unstructured.Unstructured{Object: content}, nil
+	}
+	u := &unstructured.Unstructured{Object: map[string]interface{}{}}
+	u.SetNamespace(obj.GetNamespace())
+	u.SetName(obj.GetName())
+	u.SetUID(obj.GetUID())
+	u.SetResourceVersion(obj.GetResourceVersion())
+	u.SetGeneration(obj.GetGeneration())
+	u.SetDeletionTimestamp(obj.GetDeletionTimestamp())
+	if finalizers := obj.GetFinalizers(); len(finalizers) > 0 {
+		u.SetFinalizers(finalizers)
+	}
+	if objLabels := obj.GetLabels(); len(objLabels) > 0 && len(c.labelKeys) > 0 {
+		labels := map[string]string{}
+		for _, k := range c.labelKeys {
+			if v, ok := objLabels[k]; ok {
+				labels[k] = v
+			}
+		}
+		if len(labels) > 0 {
+			u.SetLabels(labels)
+		}
+	}
+	conditions, ok := c.conditionsField.get(reflect.ValueOf(obj))
+	if !ok {
+		return u, nil
+	}
+	converted, err := runtime.DefaultUnstructuredConverter.ToUnstructured(&struct {
+		Conditions interface{} `json:"conditions"`
+	}{Conditions: conditions.Interface()})
+	if err != nil {
+		return nil, err
+	}
+	u.Object["status"] = map[string]interface{}{"conditions": converted["conditions"]}
+	return u, nil
+}
+
+// conditionsField is the location of .status.conditions in a struct
+type conditionsField struct {
+	status, conditions         int
+	statusIsPointer, omitempty bool
+}
+
+// get returns .status.conditions of v, a pointer to the struct, and false if the full conversion wouldn't have it
+func (f *conditionsField) get(v reflect.Value) (reflect.Value, bool) {
+	status := v.Elem().Field(f.status)
+	if f.statusIsPointer {
+		if status.IsNil() {
+			return reflect.Value{}, false
+		}
+		status = status.Elem()
+	}
+	conditions := status.Field(f.conditions)
+	if conditions.IsNil() || (f.omitempty && conditions.Len() == 0) {
+		return reflect.Value{}, false
+	}
+	return conditions, true
+}
+
+// findConditionsField returns where .status.conditions is in t, a pointer to a struct, if the object can be
+// converted partially with the same result as the full conversion. That is the case for plain structs with
+// .status.conditions as a slice field: no custom unstructured or JSON conversion on the object or its status, no
+// inlined fields that could hide a status, and metav1.ObjectMeta as the metadata.
+func findConditionsField(t reflect.Type) *conditionsField {
+	if t.Kind() != reflect.Pointer || t.Elem().Kind() != reflect.Struct || hasCustomConversion(t.Elem()) {
+		return nil
+	}
+	t = t.Elem()
+	f := &conditionsField{status: -1, conditions: -1}
+	for i := range t.NumField() {
+		field := t.Field(i)
+		switch name, _ := jsonFieldName(field); name {
+		case "":
+			if field.Type != reflect.TypeOf(metav1.TypeMeta{}) {
+				return nil
+			}
+		case "metadata":
+			if field.Type != reflect.TypeOf(metav1.ObjectMeta{}) {
+				return nil
+			}
+		case "status":
+			f.status = i
+		}
+	}
+	if f.status == -1 {
+		return nil
+	}
+	status := t.Field(f.status).Type
+	if status.Kind() == reflect.Pointer {
+		f.statusIsPointer = true
+		status = status.Elem()
+	}
+	if status.Kind() != reflect.Struct || hasCustomConversion(status) {
+		return nil
+	}
+	for i := range status.NumField() {
+		switch name, omitempty := jsonFieldName(status.Field(i)); name {
+		case "":
+			return nil
+		case "conditions":
+			f.conditions, f.omitempty = i, omitempty
+		}
+	}
+	if f.conditions == -1 || status.Field(f.conditions).Type.Kind() != reflect.Slice {
+		return nil
+	}
+	return f
+}
+
+// jsonFieldName returns the key runtime.DefaultUnstructuredConverter uses for a struct field ("" if inlined)
+func jsonFieldName(field reflect.StructField) (string, bool) {
+	tag := field.Tag.Get("json")
+	items := strings.Split(tag, ",")
+	name := items[0]
+	if name == "" && !field.Anonymous {
+		name = field.Name
+	}
+	return name, lo.Contains(items[1:], "omitempty")
+}
+
+// hasCustomConversion mirrors the converter's check for types that convert themselves (json.Marshaler, which
+// value.UnstructuredConverter embeds)
+func hasCustomConversion(t reflect.Type) bool {
+	return t.Implements(jsonMarshalerType) || reflect.PointerTo(t).Implements(jsonMarshalerType)
+}
+
+var jsonMarshalerType = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
 
 func (c *Controller[T]) toAdditionalMetricLabels(obj Object) map[string]string {
 	u := opunstructured.ToPartialUnstructured(obj, lo.Values(c.additionalMetricFields)...)
