@@ -19,6 +19,8 @@ import (
 	pmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/awslabs/operatorpkg/object"
 	"github.com/awslabs/operatorpkg/option"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/samber/lo"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -44,7 +46,10 @@ type Controller[T Object] struct {
 	observedFinalizers            sync.Map // map[reconcile.Request]Finalizer
 	terminatingObjects            sync.Map // map[reconcile.Request]Object
 	unchangedObjects              sync.Map // map[reconcile.Request]*unchangedObject
+	terminationGaugeLabels        sync.Map // map[reconcile.Request][]map[string]string
+	orphanedDeprecatedConditions  sync.Map // map[reconcile.Request][]Condition
 	emitDeprecatedMetrics         bool
+	untrackedDeprecatedSeries     bool
 	maxConcurrentReconciles       int
 	ConditionDuration             pmetrics.ObservationMetric
 	ConditionCount                pmetrics.GaugeMetric
@@ -116,6 +121,11 @@ func NewController[T Object](client client.Client, eventRecorder record.EventRec
 	obj := reflect.New(reflect.TypeOf(*new(T)).Elem()).Interface().(runtime.Object)
 	obj.GetObjectKind().SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
 	gvk := object.GVK(obj)
+	// The deprecated metrics are shared by every controller in the process. If a previous controller for this kind left
+	// series behind, this controller doesn't know their labels, so it falls back to DeletePartialMatch for them.
+	untrackedDeprecatedSeries := options.EmitDeprecatedMetrics && lo.SomeBy([]pmetrics.GaugeMetric{ConditionCount, ConditionCurrentStatusSeconds, TerminationCurrentTimeSeconds}, func(m pmetrics.GaugeMetric) bool {
+		return hasSeriesForKind(m, gvk)
+	})
 
 	return &Controller[T]{
 		gvk:                         gvk,
@@ -126,6 +136,7 @@ func NewController[T Object](client client.Client, eventRecorder record.EventRec
 		kubeClient:                  client,
 		eventRecorder:               eventRecorder,
 		emitDeprecatedMetrics:       options.EmitDeprecatedMetrics,
+		untrackedDeprecatedSeries:   untrackedDeprecatedSeries,
 		maxConcurrentReconciles:     lo.Ternary(options.MaxConcurrentReconciles <= 0, 10, options.MaxConcurrentReconciles),
 		ConditionDuration: conditionDurationMetric(strings.ToLower(gvk.Kind), options.HistogramBuckets, lo.Map(
 			append(options.MetricLabels, lo.Keys(options.MetricFields)...),
@@ -454,8 +465,9 @@ func (c *Controller[T]) reconcileUnchanged(req reconcile.Request, resourceVersio
 //     the current time, so every reconcile would emit a fresh current_status_seconds for them.
 //   - No condition type is repeated. The comparison with the observed conditions only looks at the first condition of
 //     a type, so a repeated type is a "transition" (and a delete of its series) on every reconcile.
-func (c *Controller[T]) recordUnchanged(req reconcile.Request, o Object, conditionsBefore, conditions []Condition, gaugeLabels map[string]string) {
-	if o.GetResourceVersion() == "" || !slices.EqualFunc(conditionsBefore, conditions, conditionsEqual) || hasRepeatedType(conditions) {
+//   - The reconcile didn't delete a series it emitted, which the next full reconcile would re-create.
+func (c *Controller[T]) recordUnchanged(req reconcile.Request, o Object, conditionsBefore, conditions []Condition, gaugeLabels map[string]string, deletedEmitted bool) {
+	if o.GetResourceVersion() == "" || deletedEmitted || !slices.EqualFunc(conditionsBefore, conditions, conditionsEqual) || hasRepeatedType(conditions) {
 		c.unchangedObjects.Delete(req)
 		return
 	}
@@ -488,22 +500,43 @@ func conditionsEqual(a, b Condition) bool {
 		a.ObservedGeneration == b.ObservedGeneration && a.LastTransitionTime.Equal(&b.LastTransitionTime)
 }
 
+// cleanupNotFound deletes every gauge series emitted for the object. Each series is deleted by its exact labels, which
+// are reconstructed from what the controller observed, rather than with DeletePartialMatch, which scans every series of
+// the vec under its write lock. The series of an object are only emitted by reconcileFound, which records them, so an
+// object without a record has no series.
 func (c *Controller[T]) cleanupNotFound(req reconcile.Request, o Object) error {
 	c.unchangedObjects.Delete(req)
-	c.observedConditions.Delete(req)
-	c.observedGaugeLabels.Delete(req)
-	c.deletePartialMatchGaugeMetric(c.ConditionCount, ConditionCount, map[string]string{
-		MetricLabelNamespace: req.Namespace,
-		MetricLabelName:      req.Name,
-	})
-	c.deletePartialMatchGaugeMetric(c.ConditionCurrentStatusSeconds, ConditionCurrentStatusSeconds, map[string]string{
-		MetricLabelNamespace: req.Namespace,
-		MetricLabelName:      req.Name,
-	})
-	c.deletePartialMatchGaugeMetric(c.TerminationCurrentTimeSeconds, TerminationCurrentTimeSeconds, map[string]string{
-		MetricLabelNamespace: req.Namespace,
-		MetricLabelName:      req.Name,
-	})
+	observedConditions, _ := c.observedConditions.LoadAndDelete(req)
+	observedGaugeLabels, _ := c.observedGaugeLabels.LoadAndDelete(req)
+	if observedConditions != nil {
+		additionalLabels, _ := observedGaugeLabels.(map[string]string)
+		for _, condition := range observedConditions.(ConditionSet).List() {
+			c.deleteConditionGaugeMetrics(req, condition, additionalLabels, true)
+		}
+	}
+	if conditions, ok := c.orphanedDeprecatedConditions.LoadAndDelete(req); ok {
+		for _, condition := range conditions.([]Condition) {
+			c.deleteDeprecatedConditionGaugeMetrics(req, condition)
+		}
+	}
+	if labelSets, ok := c.terminationGaugeLabels.LoadAndDelete(req); ok {
+		for _, additionalLabels := range labelSets.([]map[string]string) {
+			c.deleteGaugeMetric(c.TerminationCurrentTimeSeconds, TerminationCurrentTimeSeconds, map[string]string{
+				MetricLabelNamespace: req.Namespace,
+				MetricLabelName:      req.Name,
+			}, additionalLabels, true)
+		}
+	}
+	if c.untrackedDeprecatedSeries {
+		for _, deprecated := range []pmetrics.GaugeMetric{ConditionCount, ConditionCurrentStatusSeconds, TerminationCurrentTimeSeconds} {
+			deprecated.DeletePartialMatch(map[string]string{
+				MetricLabelNamespace: req.Namespace,
+				MetricLabelName:      req.Name,
+				pmetrics.LabelKind:   c.gvk.Kind,
+				pmetrics.LabelGroup:  c.gvk.Group,
+			})
+		}
+	}
 	if obj, ok := c.terminatingObjects.LoadAndDelete(req); ok {
 		c.observeHistogram(c.TerminationDuration, TerminationDuration, time.Since(obj.(Object).GetDeletionTimestamp().Time).Seconds(), map[string]string{}, c.toAdditionalMetricLabels(obj.(Object)))
 	}
@@ -535,6 +568,8 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 			MetricLabelName:      req.Name,
 		}, additionalGaugeMetricLabels)
 		c.terminatingObjects.Store(req, o)
+		// The termination gauge is only deleted once the object is gone, so remember every label set it was emitted with
+		storeUnique(&c.terminationGaugeLabels, req, additionalGaugeMetricLabels, maps.Equal)
 	}
 
 	// Detect and record condition counts
@@ -575,26 +610,22 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 		}, additionalGaugeMetricLabels)
 	}
 
+	// Set if a delete below may remove a series this reconcile just emitted, which the next reconcile re-creates
+	deletedEmitted := false
 	for _, observedCondition := range observedConditions.List() {
 		if currentCondition := currentConditions.Get(observedCondition.Type); currentCondition == nil || currentCondition.Status != observedCondition.Status || currentCondition.Reason != observedCondition.Reason || gaugeLabelsChanged {
-			// We want to check if the additional labels on the object has changed, and if so, delete the metrics with the old labels.
-			// Because we add the additional labels to the deletePartialMatchGaugeMetric() call based on if they have changed, it will not delete
-			// the deprecated metrics when the additional labels change but only when there is a change in the condition status because
-			// deprecated metrics to do not have the additional labels.
-			c.deletePartialMatchGaugeMetric(c.ConditionCount, ConditionCount, lo.Assign(map[string]string{
-				MetricLabelNamespace:       req.Namespace,
-				MetricLabelName:            req.Name,
-				pmetrics.LabelType:         observedCondition.Type,
-				MetricLabelConditionStatus: string(observedCondition.Status),
-				pmetrics.LabelReason:       observedCondition.Reason,
-			}, lo.Ternary(gaugeLabelsChanged, observedGaugeLabels, nil)))
-			c.deletePartialMatchGaugeMetric(c.ConditionCurrentStatusSeconds, ConditionCurrentStatusSeconds, lo.Assign(map[string]string{
-				MetricLabelNamespace:       req.Namespace,
-				MetricLabelName:            req.Name,
-				pmetrics.LabelType:         observedCondition.Type,
-				MetricLabelConditionStatus: string(observedCondition.Status),
-				pmetrics.LabelReason:       observedCondition.Reason,
-			}, lo.Ternary(gaugeLabelsChanged, observedGaugeLabels, nil)))
+			// The previous reconcile emitted the observed condition with the observed additional labels, so delete exactly that
+			// series. The deprecated metrics don't have the additional labels, so, as when this was a partial match including the
+			// old additional labels, they are only deleted if the additional labels didn't change (or are only kind and group,
+			// which the deprecated metrics carry with this controller's values). Otherwise they are deleted with the object.
+			deleteDeprecated := !gaugeLabelsChanged || lo.Every([]string{pmetrics.LabelKind, pmetrics.LabelGroup}, lo.Keys(observedGaugeLabels))
+			c.deleteConditionGaugeMetrics(req, observedCondition, observedGaugeLabels, deleteDeprecated)
+			// With labels changed and named only kind and group, the deprecated delete is also the one of the series
+			// just set for the condition if it didn't change
+			deletedEmitted = deletedEmitted || (c.emitDeprecatedMetrics && deleteDeprecated && gaugeLabelsChanged)
+			if c.emitDeprecatedMetrics && !deleteDeprecated {
+				storeUnique(&c.orphanedDeprecatedConditions, req, observedCondition, sameSeries)
+			}
 		}
 	}
 
@@ -641,7 +672,7 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 			lo.Ternary(condition.Message != "", fmt.Sprintf(", Message: %s", condition.Message), ""),
 		))
 	}
-	c.recordUnchanged(req, o, lo.Ternary(readOnlyConditions, conditions, conditionsBefore), conditions, additionalGaugeMetricLabels)
+	c.recordUnchanged(req, o, lo.Ternary(readOnlyConditions, conditions, conditionsBefore), conditions, additionalGaugeMetricLabels, deletedEmitted)
 	return reconcile.Result{RequeueAfter: requeueInterval}, nil
 }
 
@@ -663,13 +694,80 @@ func (c *Controller[T]) setGaugeMetric(current pmetrics.GaugeMetric, deprecated 
 	}
 }
 
-func (c *Controller[T]) deletePartialMatchGaugeMetric(current pmetrics.GaugeMetric, deprecated pmetrics.GaugeMetric, labels map[string]string) {
-	current.DeletePartialMatch(labels)
-	if c.emitDeprecatedMetrics {
+func (c *Controller[T]) deleteGaugeMetric(current pmetrics.GaugeMetric, deprecated pmetrics.GaugeMetric, labels, additionalLabels map[string]string, deleteDeprecated bool) {
+	current.Delete(lo.Assign(labels, additionalLabels))
+	if c.emitDeprecatedMetrics && deleteDeprecated {
 		labels[pmetrics.LabelKind] = c.gvk.Kind
 		labels[pmetrics.LabelGroup] = c.gvk.Group
-		deprecated.DeletePartialMatch(labels)
+		deprecated.Delete(labels)
 	}
+}
+
+func (c *Controller[T]) deleteConditionGaugeMetrics(req reconcile.Request, condition Condition, additionalLabels map[string]string, deleteDeprecated bool) {
+	for _, m := range []struct{ current, deprecated pmetrics.GaugeMetric }{
+		{c.ConditionCount, ConditionCount},
+		{c.ConditionCurrentStatusSeconds, ConditionCurrentStatusSeconds},
+	} {
+		c.deleteGaugeMetric(m.current, m.deprecated, map[string]string{
+			MetricLabelNamespace:       req.Namespace,
+			MetricLabelName:            req.Name,
+			pmetrics.LabelType:         condition.Type,
+			MetricLabelConditionStatus: string(condition.Status),
+			pmetrics.LabelReason:       condition.Reason,
+		}, additionalLabels, deleteDeprecated)
+	}
+}
+
+func (c *Controller[T]) deleteDeprecatedConditionGaugeMetrics(req reconcile.Request, condition Condition) {
+	for _, deprecated := range []pmetrics.GaugeMetric{ConditionCount, ConditionCurrentStatusSeconds} {
+		deprecated.Delete(map[string]string{
+			MetricLabelNamespace:       req.Namespace,
+			MetricLabelName:            req.Name,
+			pmetrics.LabelType:         condition.Type,
+			MetricLabelConditionStatus: string(condition.Status),
+			pmetrics.LabelReason:       condition.Reason,
+			pmetrics.LabelKind:         c.gvk.Kind,
+			pmetrics.LabelGroup:        c.gvk.Group,
+		})
+	}
+}
+
+// storeUnique appends v to the slice stored for req unless the slice already holds an equal value
+func storeUnique[V any](m *sync.Map, req reconcile.Request, v V, equal func(V, V) bool) {
+	stored, _ := m.Load(req)
+	values, _ := stored.([]V)
+	if !lo.ContainsBy(values, func(e V) bool { return equal(e, v) }) {
+		m.Store(req, append(values, v))
+	}
+}
+
+// sameSeries reports whether two conditions are emitted as the same condition gauge series
+func sameSeries(a, b Condition) bool {
+	return a.Type == b.Type && a.Status == b.Status && a.Reason == b.Reason
+}
+
+// hasSeriesForKind reports whether a gauge holds any series labeled with the given kind and group
+func hasSeriesForKind(m pmetrics.GaugeMetric, gvk schema.GroupVersionKind) bool {
+	gauge, ok := m.(*pmetrics.PrometheusGauge)
+	if !ok {
+		return true
+	}
+	ch := make(chan prometheus.Metric)
+	go func() {
+		gauge.Collect(ch)
+		close(ch)
+	}()
+	found := false
+	for metric := range ch {
+		pb := &dto.Metric{}
+		if err := metric.Write(pb); err != nil {
+			found = true
+			continue
+		}
+		labels := lo.SliceToMap(pb.GetLabel(), func(l *dto.LabelPair) (string, string) { return l.GetName(), l.GetValue() })
+		found = found || (labels[pmetrics.LabelKind] == gvk.Kind && labels[pmetrics.LabelGroup] == gvk.Group)
+	}
+	return found
 }
 
 func (c *Controller[T]) observeHistogram(current pmetrics.ObservationMetric, deprecated pmetrics.ObservationMetric, value float64, labels, additionalLabels map[string]string) {
