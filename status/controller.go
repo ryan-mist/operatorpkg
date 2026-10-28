@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,7 @@ type Controller[T Object] struct {
 	observedGaugeLabels           sync.Map // map[reconcile.Request]map[string]string
 	observedFinalizers            sync.Map // map[reconcile.Request]Finalizer
 	terminatingObjects            sync.Map // map[reconcile.Request]Object
+	unchangedObjects              sync.Map // map[reconcile.Request]*unchangedObject
 	emitDeprecatedMetrics         bool
 	maxConcurrentReconciles       int
 	ConditionDuration             pmetrics.ObservationMetric
@@ -203,6 +205,9 @@ func (c *GenericObjectController[T]) Reconcile(ctx context.Context, req reconcil
 			return reconcile.Result{}, c.cleanupNotFound(req, NewUnstructuredAdapter[T](typedObj))
 		}
 		return reconcile.Result{}, fmt.Errorf("getting object, %w", err)
+	}
+	if c.reconcileUnchanged(req, typedObj.GetResourceVersion()) {
+		return reconcile.Result{RequeueAfter: requeueInterval}, nil
 	}
 	unstructuredObj, err := c.toUnstructured(typedObj)
 	if err != nil {
@@ -395,10 +400,96 @@ func (c *Controller[T]) reconcile(ctx context.Context, req reconcile.Request, o 
 		}
 		return reconcile.Result{}, fmt.Errorf("getting object, %w", err)
 	}
+	if c.reconcileUnchanged(req, o.GetResourceVersion()) {
+		return reconcile.Result{RequeueAfter: requeueInterval}, nil
+	}
 	return c.reconcileFound(ctx, req, o)
 }
 
+// requeueInterval refreshes the time-based gauges (current_status_seconds, termination current_time_seconds)
+const requeueInterval = time.Second * 10
+
+// unchangedObject is what the last reconcile of an object emitted that depends on time
+type unchangedObject struct {
+	resourceVersion   string
+	deletionTimestamp *metav1.Time
+	conditions        []Condition
+	gaugeLabels       map[string]string
+}
+
+// reconcileUnchanged handles a reconcile of an object whose resourceVersion is the one the last reconcile saw, which is
+// most reconciles since the controller requeues every object every 10s. An object with the same resourceVersion has
+// the same content, so reconcileFound would emit nothing but the time-based gauges: the condition count series it
+// would set already exist with the same value, no condition or label changed so nothing is deleted, no condition
+// transitioned and no finalizer was removed so no histogram, counter or event is emitted, and the observed state it
+// would store is equal to what is stored. This only refreshes those gauges, with the same labels and values
+// reconcileFound would use. reconcileFound only records objects for which that holds (see recordUnchanged).
+func (c *Controller[T]) reconcileUnchanged(req reconcile.Request, resourceVersion string) bool {
+	v, ok := c.unchangedObjects.Load(req)
+	if !ok || resourceVersion == "" || v.(*unchangedObject).resourceVersion != resourceVersion {
+		return false
+	}
+	u := v.(*unchangedObject)
+	if u.deletionTimestamp != nil {
+		c.setGaugeMetric(c.TerminationCurrentTimeSeconds, TerminationCurrentTimeSeconds, time.Since(u.deletionTimestamp.Time).Seconds(), map[string]string{
+			MetricLabelNamespace: req.Namespace,
+			MetricLabelName:      req.Name,
+		}, u.gaugeLabels)
+	}
+	for _, condition := range u.conditions {
+		c.setGaugeMetric(c.ConditionCurrentStatusSeconds, ConditionCurrentStatusSeconds, time.Since(condition.LastTransitionTime.Time).Seconds(), map[string]string{
+			MetricLabelNamespace:       req.Namespace,
+			MetricLabelName:            req.Name,
+			pmetrics.LabelType:         condition.Type,
+			MetricLabelConditionStatus: string(condition.Status),
+			pmetrics.LabelReason:       condition.Reason,
+		}, u.gaugeLabels)
+	}
+	return true
+}
+
+// recordUnchanged remembers what reconcileUnchanged needs after a full reconcile, but only when a second full
+// reconcile of the same resourceVersion would provably emit only the time-based gauges:
+//   - StatusConditions() didn't change the conditions. Typed objects initialize missing conditions to Unknown with
+//     the current time, so every reconcile would emit a fresh current_status_seconds for them.
+//   - No condition type is repeated. The comparison with the observed conditions only looks at the first condition of
+//     a type, so a repeated type is a "transition" (and a delete of its series) on every reconcile.
+func (c *Controller[T]) recordUnchanged(req reconcile.Request, o Object, conditionsBefore, conditions []Condition, gaugeLabels map[string]string) {
+	if o.GetResourceVersion() == "" || !slices.EqualFunc(conditionsBefore, conditions, conditionsEqual) || hasRepeatedType(conditions) {
+		c.unchangedObjects.Delete(req)
+		return
+	}
+	c.unchangedObjects.Store(req, &unchangedObject{
+		resourceVersion:   o.GetResourceVersion(),
+		deletionTimestamp: o.GetDeletionTimestamp(),
+		conditions:        conditions,
+		gaugeLabels:       gaugeLabels,
+	})
+}
+
+func hasRepeatedType(conditions []Condition) bool {
+	for i := range conditions {
+		for j := range i {
+			if conditions[i].Type == conditions[j].Type {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// readOnlyStatusConditions is implemented by objects whose StatusConditions() never changes their conditions
+type readOnlyStatusConditions interface {
+	readOnlyStatusConditions()
+}
+
+func conditionsEqual(a, b Condition) bool {
+	return a.Type == b.Type && a.Status == b.Status && a.Reason == b.Reason && a.Message == b.Message &&
+		a.ObservedGeneration == b.ObservedGeneration && a.LastTransitionTime.Equal(&b.LastTransitionTime)
+}
+
 func (c *Controller[T]) cleanupNotFound(req reconcile.Request, o Object) error {
+	c.unchangedObjects.Delete(req)
 	c.observedConditions.Delete(req)
 	c.observedGaugeLabels.Delete(req)
 	c.deletePartialMatchGaugeMetric(c.ConditionCount, ConditionCount, map[string]string{
@@ -447,6 +538,12 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 	}
 
 	// Detect and record condition counts
+	// UnstructuredAdapter.StatusConditions only reflects the conditions, other objects may initialize missing ones
+	var conditionsBefore []Condition
+	_, readOnlyConditions := o.(readOnlyStatusConditions)
+	if !readOnlyConditions {
+		conditionsBefore = slices.Clone(o.GetConditions())
+	}
 	currentConditions := o.StatusConditions()
 	observedConditions := ConditionSet{}
 	if v, ok := c.observedConditions.Load(req); ok {
@@ -460,7 +557,8 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 	c.observedGaugeLabels.Store(req, additionalGaugeMetricLabels)
 	gaugeLabelsChanged := !maps.Equal(additionalGaugeMetricLabels, observedGaugeLabels)
 
-	for _, condition := range o.GetConditions() {
+	conditions := o.GetConditions()
+	for _, condition := range conditions {
 		c.setGaugeMetric(c.ConditionCount, ConditionCount, 1, map[string]string{
 			MetricLabelNamespace:       req.Namespace,
 			MetricLabelName:            req.Name,
@@ -543,7 +641,8 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 			lo.Ternary(condition.Message != "", fmt.Sprintf(", Message: %s", condition.Message), ""),
 		))
 	}
-	return reconcile.Result{RequeueAfter: time.Second * 10}, nil
+	c.recordUnchanged(req, o, lo.Ternary(readOnlyConditions, conditions, conditionsBefore), conditions, additionalGaugeMetricLabels)
+	return reconcile.Result{RequeueAfter: requeueInterval}, nil
 }
 
 func (c *Controller[T]) incCounterMetric(current pmetrics.CounterMetric, deprecated pmetrics.CounterMetric, labels, additionalLabels map[string]string) {
