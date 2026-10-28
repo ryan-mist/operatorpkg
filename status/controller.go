@@ -207,23 +207,27 @@ func (c *GenericObjectController[T]) Reconcile(ctx context.Context, req reconcil
 
 func (c *Controller[T]) toAdditionalMetricLabels(obj Object) map[string]string {
 	u := opunstructured.ToPartialUnstructured(obj, lo.Values(c.additionalMetricFields)...)
+	// GetLabels copies the whole label map for unstructured objects, so read it once rather than once per label
+	objLabels := obj.GetLabels()
 	return lo.Assign(
 		lo.MapEntries(c.additionalMetricFields, func(k string, v string) (string, string) {
 			elem, _, _ := unstructured.NestedString(u, lo.Filter(strings.Split(v, "."), func(s string, _ int) bool { return s != "" })...)
 			return toPrometheusLabel(k), elem
 		}),
-		lo.SliceToMap(c.additionalMetricLabels, func(label string) (string, string) { return toPrometheusLabel(label), obj.GetLabels()[label] }),
+		lo.SliceToMap(c.additionalMetricLabels, func(label string) (string, string) { return toPrometheusLabel(label), objLabels[label] }),
 	)
 }
 
-func (c *Controller[T]) toAdditionalGaugeMetricLabels(obj Object) map[string]string {
+// toAdditionalGaugeMetricLabels extends additionalMetricLabels, the result of toAdditionalMetricLabels(obj), with the gauge-only labels
+func (c *Controller[T]) toAdditionalGaugeMetricLabels(obj Object, additionalMetricLabels map[string]string) map[string]string {
 	u := opunstructured.ToPartialUnstructured(obj, lo.Values(c.additionalGaugeMetricFields)...)
+	objLabels := obj.GetLabels()
 	return lo.Assign(
 		lo.MapEntries(c.additionalGaugeMetricFields, func(k string, v string) (string, string) {
 			elem, _, _ := unstructured.NestedString(u, lo.Filter(strings.Split(v, "."), func(s string, _ int) bool { return s != "" })...)
 			return toPrometheusLabel(k), elem
 		}),
-		c.toAdditionalMetricLabels(obj), lo.SliceToMap(c.additionalGaugeMetricLabels, func(label string) (string, string) { return toPrometheusLabel(label), obj.GetLabels()[label] }),
+		additionalMetricLabels, lo.SliceToMap(c.additionalGaugeMetricLabels, func(label string) (string, string) { return toPrometheusLabel(label), objLabels[label] }),
 	)
 }
 
@@ -272,6 +276,11 @@ func (c *Controller[T]) cleanupNotFound(req reconcile.Request, o Object) error {
 }
 
 func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Request, o Object) (reconcile.Result, error) {
+	// The object can't change during the reconcile, so compute its labels once. The maps are shared by every metric call
+	// below, which is safe since they are only read (setGaugeMetric etc. copy them with lo.Assign).
+	additionalMetricLabels := c.toAdditionalMetricLabels(o)
+	additionalGaugeMetricLabels := c.toAdditionalGaugeMetricLabels(o, additionalMetricLabels)
+
 	// Detect and record terminations
 	observedFinalizers, _ := c.observedFinalizers.Swap(req, o.GetFinalizers())
 	if observedFinalizers != nil {
@@ -284,7 +293,7 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 		c.setGaugeMetric(c.TerminationCurrentTimeSeconds, TerminationCurrentTimeSeconds, time.Since(o.GetDeletionTimestamp().Time).Seconds(), map[string]string{
 			MetricLabelNamespace: req.Namespace,
 			MetricLabelName:      req.Name,
-		}, c.toAdditionalGaugeMetricLabels(o))
+		}, additionalGaugeMetricLabels)
 		c.terminatingObjects.Store(req, o)
 	}
 
@@ -299,7 +308,8 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 		observedGaugeLabels = v.(map[string]string)
 	}
 	c.observedConditions.Store(req, currentConditions)
-	c.observedGaugeLabels.Store(req, c.toAdditionalGaugeMetricLabels(o))
+	c.observedGaugeLabels.Store(req, additionalGaugeMetricLabels)
+	gaugeLabelsChanged := !maps.Equal(additionalGaugeMetricLabels, observedGaugeLabels)
 
 	for _, condition := range o.GetConditions() {
 		c.setGaugeMetric(c.ConditionCount, ConditionCount, 1, map[string]string{
@@ -308,18 +318,18 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 			pmetrics.LabelType:         condition.Type,
 			MetricLabelConditionStatus: string(condition.Status),
 			pmetrics.LabelReason:       condition.Reason,
-		}, c.toAdditionalGaugeMetricLabels(o))
+		}, additionalGaugeMetricLabels)
 		c.setGaugeMetric(c.ConditionCurrentStatusSeconds, ConditionCurrentStatusSeconds, time.Since(condition.LastTransitionTime.Time).Seconds(), map[string]string{
 			MetricLabelNamespace:       req.Namespace,
 			MetricLabelName:            req.Name,
 			pmetrics.LabelType:         condition.Type,
 			MetricLabelConditionStatus: string(condition.Status),
 			pmetrics.LabelReason:       condition.Reason,
-		}, c.toAdditionalGaugeMetricLabels(o))
+		}, additionalGaugeMetricLabels)
 	}
 
 	for _, observedCondition := range observedConditions.List() {
-		if currentCondition := currentConditions.Get(observedCondition.Type); currentCondition == nil || currentCondition.Status != observedCondition.Status || currentCondition.Reason != observedCondition.Reason || !maps.Equal(c.toAdditionalGaugeMetricLabels(o), observedGaugeLabels) {
+		if currentCondition := currentConditions.Get(observedCondition.Type); currentCondition == nil || currentCondition.Status != observedCondition.Status || currentCondition.Reason != observedCondition.Reason || gaugeLabelsChanged {
 			// We want to check if the additional labels on the object has changed, and if so, delete the metrics with the old labels.
 			// Because we add the additional labels to the deletePartialMatchGaugeMetric() call based on if they have changed, it will not delete
 			// the deprecated metrics when the additional labels change but only when there is a change in the condition status because
@@ -330,14 +340,14 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 				pmetrics.LabelType:         observedCondition.Type,
 				MetricLabelConditionStatus: string(observedCondition.Status),
 				pmetrics.LabelReason:       observedCondition.Reason,
-			}, lo.Ternary(!maps.Equal(c.toAdditionalGaugeMetricLabels(o), observedGaugeLabels), observedGaugeLabels, nil)))
+			}, lo.Ternary(gaugeLabelsChanged, observedGaugeLabels, nil)))
 			c.deletePartialMatchGaugeMetric(c.ConditionCurrentStatusSeconds, ConditionCurrentStatusSeconds, lo.Assign(map[string]string{
 				MetricLabelNamespace:       req.Namespace,
 				MetricLabelName:            req.Name,
 				pmetrics.LabelType:         observedCondition.Type,
 				MetricLabelConditionStatus: string(observedCondition.Status),
 				pmetrics.LabelReason:       observedCondition.Reason,
-			}, lo.Ternary(!maps.Equal(c.toAdditionalGaugeMetricLabels(o), observedGaugeLabels), observedGaugeLabels, nil)))
+			}, lo.Ternary(gaugeLabelsChanged, observedGaugeLabels, nil)))
 		}
 	}
 
@@ -366,7 +376,7 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 			pmetrics.LabelType:         condition.Type,
 			MetricLabelConditionStatus: string(condition.Status),
 			pmetrics.LabelReason:       condition.Reason,
-		}, c.toAdditionalMetricLabels(o))
+		}, additionalMetricLabels)
 		if observedCondition == nil {
 			continue
 		}
@@ -375,7 +385,7 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 			pmetrics.LabelType:           observedCondition.Type,
 			MetricLabelConditionStatus:   string(observedCondition.Status),
 			MetricLabelToConditionStatus: string(condition.Status),
-		}, c.toAdditionalMetricLabels(o))
+		}, additionalMetricLabels)
 		c.eventRecorder.Event(o, v1.EventTypeNormal, condition.Type, fmt.Sprintf("Status condition transitioned, Type: %s, Status: %s -> %s, Reason: %s%s",
 			condition.Type,
 			observedCondition.Status,
