@@ -83,6 +83,9 @@ func (u *UnstructuredAdapter[T]) SetConditions(conditions []Condition) {
 	}), "status", "conditions")
 }
 
+// readOnlyStatusConditions marks that StatusConditions never initializes conditions (it uses WithObservedOnly)
+func (u *UnstructuredAdapter[T]) readOnlyStatusConditions() {}
+
 func (u *UnstructuredAdapter[T]) StatusConditions(opts ...ForOption) ConditionSet {
 	conditionTypes := lo.Map(u.GetConditions(), func(condition Condition, _ int) string {
 		return condition.Type
