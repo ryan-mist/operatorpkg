@@ -44,6 +44,7 @@ type Controller[T Object] struct {
 	observedFinalizers            sync.Map // map[reconcile.Request]Finalizer
 	terminatingObjects            sync.Map // map[reconcile.Request]Object
 	unchangedObjects              sync.Map // map[reconcile.Request]*unchangedObject
+	terminationGaugeLabels        sync.Map // map[reconcile.Request][]map[string]string
 	maxConcurrentReconciles       int
 	ConditionDuration             pmetrics.ObservationMetric
 	ConditionCount                pmetrics.GaugeMetric
@@ -474,22 +475,28 @@ func conditionsEqual(a, b Condition) bool {
 		a.ObservedGeneration == b.ObservedGeneration && a.LastTransitionTime.Equal(&b.LastTransitionTime)
 }
 
+// cleanupNotFound deletes every gauge series emitted for the object. Each series is deleted by its exact labels, which
+// are reconstructed from what the controller observed, rather than with DeletePartialMatch, which scans every series of
+// the vec under its write lock. The series of an object are only emitted by reconcileFound, which records them, so an
+// object without a record has no series.
 func (c *Controller[T]) cleanupNotFound(req reconcile.Request, o Object) error {
 	c.unchangedObjects.Delete(req)
-	c.observedConditions.Delete(req)
-	c.observedGaugeLabels.Delete(req)
-	c.ConditionCount.DeletePartialMatch(map[string]string{
-		MetricLabelNamespace: req.Namespace,
-		MetricLabelName:      req.Name,
-	})
-	c.ConditionCurrentStatusSeconds.DeletePartialMatch(map[string]string{
-		MetricLabelNamespace: req.Namespace,
-		MetricLabelName:      req.Name,
-	})
-	c.TerminationCurrentTimeSeconds.DeletePartialMatch(map[string]string{
-		MetricLabelNamespace: req.Namespace,
-		MetricLabelName:      req.Name,
-	})
+	observedConditions, _ := c.observedConditions.LoadAndDelete(req)
+	observedGaugeLabels, _ := c.observedGaugeLabels.LoadAndDelete(req)
+	if observedConditions != nil {
+		additionalLabels, _ := observedGaugeLabels.(map[string]string)
+		for _, condition := range observedConditions.(ConditionSet).List() {
+			c.deleteConditionGaugeMetrics(req, condition, additionalLabels)
+		}
+	}
+	if labelSets, ok := c.terminationGaugeLabels.LoadAndDelete(req); ok {
+		for _, additionalLabels := range labelSets.([]map[string]string) {
+			c.TerminationCurrentTimeSeconds.Delete(lo.Assign(map[string]string{
+				MetricLabelNamespace: req.Namespace,
+				MetricLabelName:      req.Name,
+			}, additionalLabels))
+		}
+	}
 	if obj, ok := c.terminatingObjects.LoadAndDelete(req); ok {
 		c.TerminationDuration.Observe(time.Since(obj.(Object).GetDeletionTimestamp().Time).Seconds(), c.toAdditionalMetricLabels(obj.(Object)))
 	}
@@ -521,6 +528,12 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 			MetricLabelName:      req.Name,
 		}, additionalGaugeMetricLabels))
 		c.terminatingObjects.Store(req, o)
+		// The termination gauge is only deleted once the object is gone, so remember every label set it was emitted with
+		stored, _ := c.terminationGaugeLabels.Load(req)
+		labelSets, _ := stored.([]map[string]string)
+		if !lo.ContainsBy(labelSets, func(l map[string]string) bool { return maps.Equal(l, additionalGaugeMetricLabels) }) {
+			c.terminationGaugeLabels.Store(req, append(labelSets, additionalGaugeMetricLabels))
+		}
 	}
 
 	// Detect and record condition counts
@@ -563,21 +576,10 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 
 	for _, observedCondition := range observedConditions.List() {
 		if currentCondition := currentConditions.Get(observedCondition.Type); currentCondition == nil || currentCondition.Status != observedCondition.Status || currentCondition.Reason != observedCondition.Reason || gaugeLabelsChanged {
-			// We want to check if the additional labels on the object has changed, and if so, delete the metrics with the old labels.
-			c.ConditionCount.DeletePartialMatch(lo.Assign(map[string]string{
-				MetricLabelNamespace:       req.Namespace,
-				MetricLabelName:            req.Name,
-				pmetrics.LabelType:         observedCondition.Type,
-				MetricLabelConditionStatus: string(observedCondition.Status),
-				pmetrics.LabelReason:       observedCondition.Reason,
-			}, lo.Ternary(gaugeLabelsChanged, observedGaugeLabels, nil)))
-			c.ConditionCurrentStatusSeconds.DeletePartialMatch(lo.Assign(map[string]string{
-				MetricLabelNamespace:       req.Namespace,
-				MetricLabelName:            req.Name,
-				pmetrics.LabelType:         observedCondition.Type,
-				MetricLabelConditionStatus: string(observedCondition.Status),
-				pmetrics.LabelReason:       observedCondition.Reason,
-			}, lo.Ternary(gaugeLabelsChanged, observedGaugeLabels, nil)))
+			// The previous reconcile emitted the observed condition with the observed additional labels, so delete exactly that
+			// series. This is also what a partial match deleted, as every other series of the object carries the current
+			// conditions or the current additional labels.
+			c.deleteConditionGaugeMetrics(req, observedCondition, observedGaugeLabels)
 		}
 	}
 
@@ -626,4 +628,16 @@ func (c *Controller[T]) reconcileFound(ctx context.Context, req reconcile.Reques
 	}
 	c.recordUnchanged(req, o, lo.Ternary(readOnlyConditions, conditions, conditionsBefore), conditions, additionalGaugeMetricLabels)
 	return reconcile.Result{RequeueAfter: requeueInterval}, nil
+}
+
+func (c *Controller[T]) deleteConditionGaugeMetrics(req reconcile.Request, condition Condition, additionalLabels map[string]string) {
+	labels := lo.Assign(map[string]string{
+		MetricLabelNamespace:       req.Namespace,
+		MetricLabelName:            req.Name,
+		pmetrics.LabelType:         condition.Type,
+		MetricLabelConditionStatus: string(condition.Status),
+		pmetrics.LabelReason:       condition.Reason,
+	}, additionalLabels)
+	c.ConditionCount.Delete(labels)
+	c.ConditionCurrentStatusSeconds.Delete(labels)
 }
